@@ -73,6 +73,21 @@ isRetryable := func(err error) bool {
 err := retry.Do(ctx, 5, 100*time.Millisecond, 2.0, op, retry.RetryIf(isRetryable))
 ```
 
+### Capping the delay and observing retries
+
+`MaxDelay` stops the exponential backoff from growing past a ceiling, and
+`OnRetry` is called right before each wait, which is handy for logging or
+metrics:
+
+```go
+err := retry.Do(ctx, 8, 100*time.Millisecond, 2.0, op,
+	retry.MaxDelay(2*time.Second), // waits: 100ms, 200ms, 400ms, 800ms, 1.6s, 2s, 2s
+	retry.OnRetry(func(attempt int, err error, delay time.Duration) {
+		log.Printf("attempt %d failed (%v); retrying in %v", attempt, err, delay)
+	}),
+)
+```
+
 ## API
 
 ### `func Do(ctx context.Context, maxAttempts int, initialDelay time.Duration, backoffMultiplier float64, fn func() error, opts ...Option) error`
@@ -90,7 +105,7 @@ Calls `fn`, retrying on failure with exponential backoff.
 
 ### `type Option`
 
-`Option` customizes `Do`'s behavior. Currently one option is provided:
+`Option` customizes `Do`'s behavior. The available options are:
 
 ### `func RetryIf(predicate func(err error) bool) Option`
 
@@ -98,6 +113,21 @@ Overrides which errors are considered retryable. `predicate` is called
 with the error from each failed attempt; if it returns `false`, `Do`
 stops immediately and returns that error without making further
 attempts. If `RetryIf` is not supplied, every non-nil error is retried.
+
+### `func MaxDelay(d time.Duration) Option`
+
+Caps the backoff delay: once the growing delay would exceed `d`, every later
+wait is exactly `d`. `d <= 0` means no cap (the default). The cap also
+prevents the delay from overflowing `time.Duration` when the multiplier or
+attempt count is large.
+
+### `func OnRetry(fn func(attempt int, err error, delay time.Duration)) Option`
+
+Registers a callback invoked right before `Do` sleeps ahead of a retry, with
+the 1-based number of the attempt that just failed, its error, and the delay
+about to be waited (after any `MaxDelay` cap). It is not called after the
+final attempt or when `RetryIf` reports the error as non-retryable, since no
+retry follows in those cases.
 
 ## Testing
 

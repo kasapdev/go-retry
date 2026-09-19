@@ -5,6 +5,7 @@ package retry
 
 import (
 	"context"
+	"math"
 	"time"
 )
 
@@ -13,7 +14,34 @@ type Option func(*config)
 
 // config holds the tunable behavior applied by Options.
 type config struct {
-	retryIf func(error) bool
+	retryIf  func(error) bool
+	maxDelay time.Duration
+	onRetry  func(attempt int, err error, delay time.Duration)
+}
+
+// MaxDelay returns an Option that caps the backoff delay. Once the
+// exponentially growing delay would exceed d, every later wait is exactly d.
+// A d of zero or less means "no cap" (the default).
+//
+// Besides keeping worst-case latency predictable, a cap prevents the delay
+// from overflowing time.Duration when backoffMultiplier is large or
+// maxAttempts is high.
+func MaxDelay(d time.Duration) Option {
+	return func(c *config) {
+		c.maxDelay = d
+	}
+}
+
+// OnRetry returns an Option that registers a callback invoked right before
+// Do sleeps ahead of a retry. It receives the 1-based number of the attempt
+// that just failed, that attempt's error, and the delay Do is about to wait
+// (after any MaxDelay cap). It is not called after the final attempt, nor
+// when RetryIf reports the error as non-retryable, since no retry follows in
+// either case. Use it for logging or metrics.
+func OnRetry(fn func(attempt int, err error, delay time.Duration)) Option {
+	return func(c *config) {
+		c.onRetry = fn
+	}
 }
 
 // RetryIf returns an Option that overrides which errors are considered
@@ -86,14 +114,41 @@ func Do(ctx context.Context, maxAttempts int, initialDelay time.Duration, backof
 			break
 		}
 
-		if err := sleep(ctx, delay); err != nil {
+		wait := capDelay(delay, cfg.maxDelay)
+		if cfg.onRetry != nil {
+			cfg.onRetry(attempt, lastErr, wait)
+		}
+
+		if err := sleep(ctx, wait); err != nil {
 			return err
 		}
 
-		delay = time.Duration(float64(delay) * backoffMultiplier)
+		delay = nextDelay(delay, backoffMultiplier, cfg.maxDelay)
 	}
 
 	return lastErr
+}
+
+// capDelay returns d limited to max when max is positive.
+func capDelay(d, max time.Duration) time.Duration {
+	if max > 0 && d > max {
+		return max
+	}
+	return d
+}
+
+// nextDelay scales d by multiplier, clamping to max (when positive) and to
+// the largest representable Duration so the result can never overflow into a
+// negative value, which would make the next sleep return immediately.
+func nextDelay(d time.Duration, multiplier float64, max time.Duration) time.Duration {
+	next := float64(d) * multiplier
+	if max > 0 && next > float64(max) {
+		return max
+	}
+	if next >= float64(math.MaxInt64) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(next)
 }
 
 // sleep blocks for d, or returns ctx.Err() promptly if ctx is done first.
